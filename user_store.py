@@ -39,6 +39,18 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS diagnosis_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -75,6 +87,7 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_sessions_token ON auth_sessions(token_hash)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_diagnosis_user ON diagnosis_records(user_id, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_reviews_record ON reviews(diagnosis_record_id, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_reviews_visibility ON reviews(visibility, id DESC)")
@@ -135,6 +148,72 @@ def verify_user(username: str, password: str) -> bool:
     except Exception:
         return False
     return secrets.compare_digest(candidate, row["password_hash"])
+
+
+def create_login_session(username: str) -> str | None:
+    """로그인 성공 시 브라우저 세션 쿠키에 저장할 무작위 토큰을 만든다."""
+    user_id = get_user_id(username)
+    if user_id is None:
+        return None
+
+    raw_token = secrets.token_urlsafe(48)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    now = datetime.now().isoformat(timespec="seconds")
+
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO auth_sessions (user_id, token_hash, created_at, last_seen_at) VALUES (?, ?, ?, ?)",
+            (user_id, token_hash, now, now),
+        )
+        conn.commit()
+        return raw_token
+    finally:
+        conn.close()
+
+
+def get_username_by_session(session_token: str) -> str | None:
+    """브라우저 세션 토큰으로 사용자를 복원한다."""
+    token = str(session_token or "").strip()
+    if not token:
+        return None
+
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            """
+            SELECT u.username
+            FROM auth_sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.token_hash = ?
+            """,
+            (token_hash,),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            "UPDATE auth_sessions SET last_seen_at = ? WHERE token_hash = ?",
+            (datetime.now().isoformat(timespec="seconds"), token_hash),
+        )
+        conn.commit()
+        return str(row["username"])
+    finally:
+        conn.close()
+
+
+def delete_login_session(session_token: str | None) -> None:
+    """로그아웃 시 현재 브라우저 세션 토큰을 폐기한다."""
+    token = str(session_token or "").strip()
+    if not token:
+        return
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_user_id(username: str) -> int | None:

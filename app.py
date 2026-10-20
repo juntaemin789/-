@@ -12,9 +12,14 @@ import time
 
 import streamlit as st
 import streamlit.components.v1 as components
+try:
+    import streamlit.components.v2 as components_v2
+except Exception:
+    components_v2 = None
+from streamlit_cookies_controller import CookieController, RemoveEmptyElementContainer
 from PIL import Image, ImageDraw
 
-from checker import SPECS, check_image
+from checker import SPECS, check_image, classify_type
 from diagnosis import diagnose_detailed, render_diagnosis_markdown
 from criteria import DEFAULT_CRITERIA, PLATFORM_PRESETS, build_selected_criteria
 from market_analysis import (
@@ -35,6 +40,9 @@ from user_store import (
     load_reviews_for_record,
     load_public_reviews,
     load_all_reviews,
+    create_login_session,
+    get_username_by_session,
+    delete_login_session,
 )
 from report_utils import (
     build_pdf_report,
@@ -46,80 +54,1126 @@ from report_utils import (
 st.set_page_config(
     page_title="OGQ 스티커 닥터",
     page_icon="🩺",
-    layout="centered",
+    layout="wide",
 )
+
+# 새로고침 시에도 같은 브라우저 세션에서는 로그인 상태를 복원합니다.
+if "_sd_cookie_controller" not in st.session_state:
+    st.session_state["_sd_cookie_controller"] = CookieController(key="sd_cookie_controller")
+_cookie_controller = st.session_state["_sd_cookie_controller"]
+RemoveEmptyElementContainer()
+
+
+# 최신 Streamlit의 페이지 DOM에 직접 연결되는 UI 보조 컴포넌트입니다.
+# 브라우저 자동재생 정책 때문에 iframe 내부에서만 재생하던 기존 방식 대신,
+# 실제 3·4단계 실행 버튼의 클릭 이벤트에서 AudioContext를 먼저 활성화합니다.
+_completion_sound_component = None
+if components_v2 is not None:
+    _UI_HELPER_JS = r"""
+export default function(component) {
+    const { data } = component;
+    const state = window.__ogqStickerDoctorUI || (window.__ogqStickerDoctorUI = {
+        audioContext: null,
+        clickHandler: null,
+        sidebarObserver: null,
+        bodyObserver: null,
+        sidebarButton: null,
+        lastPlayNonce: null,
+        menuButton: null,
+        menuClickHandler: null,
+        lastActivatedTab: null,
+    });
+
+    function createAudioContext() {
+        try {
+            const AC = window.AudioContext || window.webkitAudioContext;
+            if (!AC) return null;
+            if (!state.audioContext || state.audioContext.state === 'closed') {
+                state.audioContext = new AC();
+            }
+            if (state.audioContext.state === 'suspended') {
+                state.audioContext.resume().catch(() => {});
+            }
+            return state.audioContext;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function playDing() {
+        const ctx = createAudioContext();
+        if (!ctx) return;
+        try {
+            const now = ctx.currentTime + 0.01;
+            const gain = ctx.createGain();
+            gain.gain.setValueAtTime(0.0001, now);
+            gain.gain.exponentialRampToValueAtTime(0.40, now + 0.015);
+            gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.45);
+            gain.connect(ctx.destination);
+
+            const osc1 = ctx.createOscillator();
+            osc1.type = 'sine';
+            osc1.frequency.setValueAtTime(880, now);
+            osc1.frequency.exponentialRampToValueAtTime(1320, now + 0.10);
+            osc1.connect(gain);
+
+            const osc2 = ctx.createOscillator();
+            osc2.type = 'sine';
+            osc2.frequency.setValueAtTime(1320, now + 0.12);
+            osc2.frequency.exponentialRampToValueAtTime(1760, now + 0.24);
+            osc2.connect(gain);
+
+            osc1.start(now);
+            osc1.stop(now + 0.11);
+            osc2.start(now + 0.12);
+            osc2.stop(now + 0.30);
+        } catch (_) {}
+    }
+
+    function onAppClick(event) {
+        const button = event.target.closest && event.target.closest('button');
+        if (!button) return;
+        const label = (button.innerText || button.getAttribute('aria-label') || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        if (
+            label.includes('OGQ 시장과 비교하기') ||
+            label.includes('전체 AI 진단 받기')
+        ) {
+            // 사용자 클릭 제스처 안에서 오디오 컨텍스트를 활성화합니다.
+            createAudioContext();
+        }
+    }
+
+    if (!state.clickHandler) {
+        state.clickHandler = onAppClick;
+        document.addEventListener('click', state.clickHandler, true);
+    }
+
+    function findWorkspaceTab(label) {
+        const tabs = Array.from(document.querySelectorAll('button[role="tab"], [data-baseweb="tab"]'));
+        return tabs.find((tab) => (tab.innerText || '').replace(/\s+/g, ' ').trim() === label) || null;
+    }
+
+    function getSidebarToggle() {
+        return document.querySelector(
+            '[data-testid="stSidebarCollapseButton"] button, ' +
+            '[data-testid="collapsedControl"] button'
+        );
+    }
+
+    function toggleSidebar() {
+        const toggle = getSidebarToggle();
+        if (toggle) toggle.click();
+    }
+
+    function ensureMenuUI() {
+        let button = document.getElementById('ogq-main-menu');
+        if (!button) {
+            button = document.createElement('button');
+            button.id = 'ogq-main-menu';
+            button.type = 'button';
+            button.setAttribute('aria-label', '메뉴 열기');
+            button.setAttribute('aria-expanded', 'false');
+            button.innerHTML = '☰ <span>메뉴</span>';
+            button.style.cssText = [
+                'position:fixed', 'left:14px', 'top:116px', 'z-index:1000001',
+                'display:none', 'align-items:center', 'gap:7px', 'height:42px', 'padding:0 16px',
+                'border:1px solid #D9DCEA', 'border-radius:13px', 'background:#ffffff',
+                'color:#171A2B', 'font:800 14px/1 sans-serif', 'box-shadow:0 10px 28px rgba(25,31,57,.15)',
+                'cursor:pointer',
+            ].join(';');
+            button.addEventListener('click', () => {
+                toggleSidebar();
+                button.setAttribute('aria-expanded', 'true');
+            });
+            document.body.appendChild(button);
+        }
+        state.menuButton = button;
+        return button;
+    }
+
+    function updateMenuVisibility(authenticated) {
+        const button = ensureMenuUI();
+        const sidebar = document.querySelector('[data-testid="stSidebar"]');
+        const expanded = sidebar && sidebar.getAttribute('aria-expanded') === 'true';
+        const visible = authenticated === true && !expanded;
+        button.style.display = visible ? 'flex' : 'none';
+        button.setAttribute('aria-expanded', expanded ? 'false' : 'false');
+
+        // 로그인 후에는 메인 탭 UI를 숨기고, 실제 사이드바의 메뉴 버튼으로 이동합니다.
+        document.querySelectorAll('div[role="tablist"]').forEach((tablist) => {
+            const labels = Array.from(tablist.querySelectorAll('[role="tab"], [data-baseweb="tab"]'))
+                .map((tab) => (tab.innerText || '').replace(/\s+/g, ' ').trim());
+            if (labels.includes('🩺 검사하기') && labels.includes('📚 히스토리') && labels.includes('💬 리뷰')) {
+                tablist.style.display = authenticated === true ? 'none' : '';
+            }
+        });
+    }
+
+    function activateTargetTab(target) {
+        if (!target || state.lastActivatedTab === target) return;
+        const labelMap = { check: '🩺 검사하기', history: '📚 히스토리', reviews: '💬 리뷰' };
+        const tab = findWorkspaceTab(labelMap[target]);
+        if (!tab) return;
+        state.lastActivatedTab = target;
+        tab.click();
+    }
+
+    const sidebar = document.querySelector('[data-testid="stSidebar"]');
+    if (sidebar) {
+        if (state.sidebarObserver) state.sidebarObserver.disconnect();
+        state.sidebarObserver = new MutationObserver(() => updateMenuVisibility(Boolean(data && data.authenticated)));
+        state.sidebarObserver.observe(sidebar, { attributes: true, attributeFilter: ['aria-expanded'] });
+    }
+
+    if (state.bodyObserver) state.bodyObserver.disconnect();
+    state.bodyObserver = new MutationObserver(() => {
+        updateMenuVisibility(Boolean(data && data.authenticated));
+        activateTargetTab(data && data.target_tab);
+    });
+    state.bodyObserver.observe(document.body, { childList: true, subtree: true });
+
+    updateMenuVisibility(Boolean(data && data.authenticated));
+    activateTargetTab(data && data.target_tab);
+
+    if (data && data.play && data.nonce !== state.lastPlayNonce) {
+        state.lastPlayNonce = data.nonce;
+        setTimeout(playDing, 30);
+    }
+
+    return () => {};
+}
+"""
+    _completion_sound_component = components_v2.component(
+        "ogq_sticker_doctor_ui_helper",
+        html='<div aria-hidden="true"></div>',
+        css=':host { display: none !important; width: 0 !important; height: 0 !important; }',
+        js=_UI_HELPER_JS,
+        isolate_styles=False,
+    )
+
+# 페이지 DOM 보조 컴포넌트를 한 번 등록합니다.
+if _completion_sound_component is not None:
+    _completion_sound_component(data={"play": False, "nonce": 0, "authenticated": False})
 
 
 st.markdown(
     """
     <style>
+    /* =========================================================
+       STICKER DOCTOR — DESIGN ONLY
+       기능/상태/API/위젯 구조와 무관한 시각 레이어만 정의합니다.
+       ========================================================= */
+    @import url('https://fonts.googleapis.com/icon?family=Material+Symbols+Rounded');
+    @import url('https://fonts.googleapis.com/css2?family=Jua&family=Noto+Sans+KR:wght@400;500;600;700;800&display=swap');
+
     :root {
-        --mint-primary: #0F9B8E;
-        --mint-light: #EEFBF9;
-        --mint-border: #BFEFE9;
+        --sd-primary: #5B63F6;
+        --sd-primary-2: #7C68EE;
+        --sd-accent: #B7A8FF;
+        --sd-mint: #63D7B1;
+        --sd-sky: #69B8FF;
+        --sd-pink: #FF89B4;
+
+        --sd-bg: #F6F7FB;
+        --sd-card: #FFFFFF;
+        --sd-card-soft: #FBFBFE;
+        --sd-ink: #171A2B;
+        --sd-muted: #73798E;
+        --sd-line: #E7E9F1;
+        --sd-line-strong: #D9DCEA;
+
+        --sd-success: #3DB98A;
+        --sd-warning: #E9B64D;
+        --sd-danger: #EF6C84;
+
+        --sd-radius: 22px;
+        --sd-radius-sm: 14px;
+        --sd-radius-lg: 30px;
+        --sd-shadow-sm: 0 5px 18px rgba(25, 31, 57, .05);
+        --sd-shadow-md: 0 14px 38px rgba(25, 31, 57, .09);
+        --sd-shadow-lg: 0 24px 60px rgba(25, 31, 57, .12);
     }
-    div[data-testid="stExpander"] {
-        border: 1px solid var(--mint-border);
-        border-radius: 14px;
-        box-shadow: 0 2px 10px rgba(15, 155, 142, 0.08);
+
+    * { box-sizing: border-box; }
+
+    html, body, [data-testid="stAppViewContainer"] {
+        background:
+            radial-gradient(circle at 8% 4%, rgba(91,99,246,.08), transparent 25%),
+            radial-gradient(circle at 92% 10%, rgba(99,215,177,.08), transparent 22%),
+            var(--sd-bg) !important;
+        color: var(--sd-ink) !important;
+    }
+
+    body,
+    [data-testid="stAppViewContainer"] * {
+        font-family: 'Noto Sans KR', system-ui, sans-serif;
+    }
+
+    /* Streamlit Material Symbols: isolate native icons from the app font. */
+    [data-testid="stIconMaterial"],
+    [data-testid="stIconMaterial"] *,
+    .material-symbols-rounded,
+    .material-symbols-outlined,
+    .material-symbols-sharp,
+    .material-icons,
+    .material-icons-outlined,
+    .material-icons-round,
+    .material-icons-sharp {
+        font-family: 'Material Symbols Rounded' !important;
+        font-style: normal !important;
+        font-weight: 500 !important;
+        font-size: 1.25rem !important;
+        line-height: 1 !important;
+        letter-spacing: normal !important;
+        text-transform: none !important;
+        white-space: nowrap !important;
+        word-wrap: normal !important;
+        direction: ltr !important;
+        -webkit-font-feature-settings: 'liga' !important;
+        font-feature-settings: 'liga' !important;
+        font-variation-settings: 'FILL' 0, 'wght' 500, 'GRAD' 0, 'opsz' 24 !important;
+        -webkit-font-smoothing: antialiased !important;
+    }
+
+    [data-testid="stAppViewContainer"] > .main {
+        padding-top: 1.2rem;
+        padding-bottom: 4.5rem;
+    }
+
+    .block-container {
+        max-width: 1320px !important;
+        padding-left: clamp(1rem, 3vw, 2.6rem) !important;
+        padding-right: clamp(1rem, 3vw, 2.6rem) !important;
+    }
+
+    [data-testid="stHeader"] {
+        background: transparent !important;
+        box-shadow: none !important;
+    }
+
+    [data-testid="stToolbar"] { display: none !important; }
+    footer { visibility: hidden; height: 0; }
+
+    h1, h2, h3, h4,
+    [data-testid="stMetricValue"] {
+        font-family: 'Jua', 'Noto Sans KR', sans-serif !important;
+        color: var(--sd-ink) !important;
+        letter-spacing: -.025em;
+    }
+
+    h1 { font-size: clamp(2.1rem, 4.4vw, 4rem) !important; line-height: 1.06 !important; }
+    h2 { font-size: clamp(1.35rem, 2vw, 1.8rem) !important; line-height: 1.2 !important; }
+    h3 { font-size: 1.18rem !important; }
+
+    p, label, [data-testid="stCaptionContainer"] {
+        color: var(--sd-muted) !important;
+    }
+
+    /* =========================================================
+       HERO
+       ========================================================= */
+    .hero-banner {
+        position: relative;
+        overflow: hidden;
+        min-height: 330px;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        padding: 48px clamp(26px, 5vw, 64px);
+        margin: 0 0 22px;
+        border: 1px solid rgba(91,99,246,.13);
+        border-radius: var(--sd-radius-lg);
+        background:
+            radial-gradient(circle at 86% 18%, rgba(183,168,255,.42), transparent 18%),
+            radial-gradient(circle at 93% 76%, rgba(99,215,177,.25), transparent 20%),
+            linear-gradient(135deg, #FFFFFF 0%, #F8F9FF 52%, #F7FAFF 100%);
+        box-shadow: var(--sd-shadow-lg);
+        isolation: isolate;
+        animation: sd-hero-in .55s cubic-bezier(.2,.8,.2,1) both;
+    }
+
+    .hero-banner::before {
+        content: "";
+        position: absolute;
+        width: 230px;
+        height: 230px;
+        right: 8%;
+        top: 50%;
+        border-radius: 50%;
+        transform: translateY(-50%);
+        background: linear-gradient(145deg, rgba(91,99,246,.15), rgba(124,104,238,.05));
+        filter: blur(1px);
+        z-index: -1;
+        animation: sd-float 5.5s ease-in-out infinite;
+    }
+
+    .hero-banner::after {
+        content: "";
+        position: absolute;
+        width: 76px;
+        height: 76px;
+        right: 16%;
+        top: 21%;
+        border-radius: 20px;
+        background: rgba(255,255,255,.72);
+        border: 1px solid rgba(91,99,246,.12);
+        box-shadow: var(--sd-shadow-md);
+        transform: rotate(11deg);
+        z-index: -1;
+        animation: sd-float 4.4s ease-in-out infinite reverse;
+    }
+
+    .hero-banner h1,
+    .hero-banner h2,
+    .hero-banner p {
+        color: var(--sd-ink) !important;
+        position: relative;
+        z-index: 1;
+    }
+
+    .hero-banner h1 {
+        max-width: 760px;
+        margin: 0 0 14px !important;
+    }
+
+    .hero-banner p {
+        max-width: 650px;
+        margin: 0 !important;
+        font-size: 1rem;
+        line-height: 1.8;
+    }
+
+    .sd-kicker {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        width: fit-content;
+        margin-bottom: 14px;
+        padding: 7px 11px;
+        border: 1px solid rgba(91,99,246,.16);
+        border-radius: 999px;
+        background: rgba(255,255,255,.82);
+        color: var(--sd-primary);
+        font-size: .74rem;
+        font-weight: 800;
+        letter-spacing: .08em;
+        box-shadow: 0 4px 14px rgba(25,31,57,.04);
+        backdrop-filter: blur(10px);
+    }
+
+    .sd-note {
+        padding: 10px 14px;
+        border: 1px solid var(--sd-line);
+        border-radius: 999px;
+        background: rgba(255,255,255,.86);
+        color: var(--sd-ink) !important;
+        box-shadow: var(--sd-shadow-sm);
+        backdrop-filter: blur(10px);
+    }
+
+    /* =========================================================
+       TABS / NAV
+       ========================================================= */
+    [data-testid="stTabs"] [data-baseweb="tab-list"] {
+        gap: 5px;
+        padding: 5px;
+        margin-bottom: 24px;
+        border: 1px solid var(--sd-line);
+        border-radius: 16px;
+        background: rgba(255,255,255,.72);
+        box-shadow: var(--sd-shadow-sm);
+        backdrop-filter: blur(10px);
+    }
+
+    [data-testid="stTabs"] [data-baseweb="tab"] {
+        height: 44px;
+        padding: 0 18px;
+        border: 0 !important;
+        border-radius: 11px;
+        background: transparent !important;
+        color: var(--sd-muted) !important;
+        font-weight: 800;
+        font-size: .88rem;
+        transition: transform .18s ease, background-color .18s ease, color .18s ease, box-shadow .18s ease;
+    }
+
+    [data-testid="stTabs"] [data-baseweb="tab"]:hover {
+        color: var(--sd-ink) !important;
+        transform: translateY(-1px);
+    }
+
+    [data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] {
+        background: var(--sd-ink) !important;
+        color: #FFFFFF !important;
+        box-shadow: 0 7px 16px rgba(23,26,43,.12);
+    }
+
+    [data-testid="stTabs"] [data-baseweb="tab-highlight"],
+    [data-testid="stTabs"] [data-baseweb="tab-border"] {
+        display: none !important;
+    }
+
+    /* =========================================================
+       FLOW / BENTO
+       ========================================================= */
+    .sd-flow {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+        margin: 0 0 26px;
+        animation: sd-fade-up .5s .06s cubic-bezier(.2,.8,.2,1) both;
+    }
+
+    .sd-flow-item {
+        position: relative;
+        padding: 14px 15px;
+        border: 1px solid var(--sd-line);
+        border-radius: 16px;
+        background: rgba(255,255,255,.92);
+        box-shadow: var(--sd-shadow-sm);
+        color: var(--sd-ink);
+        font-size: .82rem;
+        font-weight: 800;
+        transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease;
         overflow: hidden;
     }
-    div[data-testid="stExpander"] summary { font-weight: 600; }
-    button[kind="secondary"], button[kind="primary"] {
-        border-radius: 999px !important;
-        font-weight: 600 !important;
+
+    .sd-flow-item::after {
+        content: "";
+        position: absolute;
+        width: 72px;
+        height: 72px;
+        right: -30px;
+        bottom: -34px;
+        border-radius: 50%;
+        background: rgba(91,99,246,.07);
+        pointer-events: none;
     }
-    div[data-testid="stFileUploaderDropzone"] {
-        border-radius: 14px;
-        border: 1.5px dashed var(--mint-border);
-        background-color: var(--mint-light);
+
+    .sd-flow-item:hover {
+        transform: translateY(-3px);
+        border-color: rgba(91,99,246,.18);
+        box-shadow: var(--sd-shadow-md);
     }
-    .hero-banner {
-        background: linear-gradient(135deg, #0F9B8E 0%, #14B8A6 100%);
-        border-radius: 18px;
-        padding: 28px 32px;
-        color: white;
-        margin-bottom: 28px;
+
+    .sd-flow-arrow { display: none; }
+
+    /* =========================================================
+       BUTTONS
+       ========================================================= */
+    [data-testid="stButton"] button,
+    [data-testid="stFormSubmitButton"] button,
+    [data-testid="stDownloadButton"] button {
+        min-height: 44px;
+        padding: 0 18px !important;
+        border: 1px solid var(--sd-line-strong) !important;
+        border-radius: 12px !important;
+        background: #FFFFFF !important;
+        color: var(--sd-ink) !important;
+        box-shadow: var(--sd-shadow-sm) !important;
+        font-weight: 800 !important;
+        transition: transform .18s cubic-bezier(.2,.8,.2,1), box-shadow .18s ease, border-color .18s ease, background-color .18s ease !important;
+        will-change: transform;
     }
-    .hero-banner h1 { margin: 0 0 6px 0; font-size: 1.6rem; }
-    .hero-banner p { margin: 0; opacity: 0.92; font-size: 0.95rem; }
-    .score-card {
-        background: var(--mint-light);
-        border: 1px solid var(--mint-border);
-        border-radius: 16px;
-        padding: 18px 22px;
-        margin-bottom: 20px;
+
+    [data-testid="stButton"] button:hover,
+    [data-testid="stFormSubmitButton"] button:hover,
+    [data-testid="stDownloadButton"] button:hover {
+        transform: translateY(-3px) scale(1.018);
+        box-shadow: var(--sd-shadow-md) !important;
+        border-color: rgba(91,99,246,.25) !important;
+        background: #FCFCFF !important;
     }
-    .score-card .score-num {
-        font-size: 2.2rem;
+
+    [data-testid="stButton"] button:active,
+    [data-testid="stFormSubmitButton"] button:active,
+    [data-testid="stDownloadButton"] button:active {
+        transform: translateY(-1px) scale(.987) !important;
+        box-shadow: var(--sd-shadow-sm) !important;
+    }
+
+    [data-testid="stButton"] button[kind="primary"],
+    [data-testid="stFormSubmitButton"] button[kind="primary"] {
+        background: var(--sd-primary) !important;
+        border-color: var(--sd-primary) !important;
+        color: #FFFFFF !important;
+        box-shadow: 0 10px 22px rgba(91,99,246,.22) !important;
+    }
+
+    [data-testid="stButton"] button[kind="primary"]:hover,
+    [data-testid="stFormSubmitButton"] button[kind="primary"]:hover {
+        background: var(--sd-primary-2) !important;
+        border-color: var(--sd-primary-2) !important;
+        box-shadow: 0 15px 28px rgba(91,99,246,.28) !important;
+    }
+
+    /* 주요 실행 버튼의 텍스트/아이콘 대비를 확실하게 고정 */
+    [data-testid="stButton"] button[kind="primary"] *,
+    [data-testid="stFormSubmitButton"] button[kind="primary"] * {
+        color: #FFFFFF !important;
+        text-shadow: 0 1px 2px rgba(20, 24, 48, .12);
+    }
+
+    /* 사이드바를 닫았을 때도 Streamlit 기본 펼치기 토글이 항상 보이도록 보정 */
+    [data-testid="stSidebarCollapseButton"],
+    [data-testid="collapsedControl"] {
+        visibility: visible !important;
+        opacity: 1 !important;
+        z-index: 999999 !important;
+    }
+
+    [data-testid="collapsedControl"] button,
+    [data-testid="stSidebarCollapseButton"] button {
+        color: #171A2B !important;
+        background: rgba(255,255,255,.97) !important;
+        border: 1px solid #D9DCEA !important;
+        border-radius: 12px !important;
+        box-shadow: 0 8px 24px rgba(25,31,57,.12) !important;
+    }
+
+    [data-testid="collapsedControl"] button:hover,
+    [data-testid="stSidebarCollapseButton"] button:hover {
+        background: #FFFFFF !important;
+        border-color: rgba(91,99,246,.30) !important;
+    }
+
+    /* =========================================================
+       INPUTS
+       ========================================================= */
+    [data-testid="stTextInput"] input,
+    [data-testid="stTextArea"] textarea,
+    [data-testid="stNumberInput"] input,
+    [data-testid="stSelectbox"] > div > div,
+    [data-testid="stMultiSelect"] > div > div {
+        border: 1px solid var(--sd-line-strong) !important;
+        border-radius: 12px !important;
+        background: #FFFFFF !important;
+        color: var(--sd-ink) !important;
+        box-shadow: 0 2px 8px rgba(25,31,57,.025);
+        transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease;
+    }
+
+    [data-testid="stTextInput"] input:hover,
+    [data-testid="stTextArea"] textarea:hover,
+    [data-testid="stNumberInput"] input:hover,
+    [data-testid="stSelectbox"] > div > div:hover,
+    [data-testid="stMultiSelect"] > div > div:hover {
+        border-color: #CCD0E0 !important;
+    }
+
+    [data-testid="stTextInput"] input:focus,
+    [data-testid="stTextArea"] textarea:focus,
+    [data-testid="stNumberInput"] input:focus {
+        border-color: rgba(91,99,246,.55) !important;
+        box-shadow: 0 0 0 4px rgba(91,99,246,.08) !important;
+    }
+
+    [data-testid="stTextArea"] textarea {
+        min-height: 110px;
+        padding: 13px 15px !important;
+        border-radius: 14px !important;
+    }
+
+    /* =========================================================
+       CARDS / CONTAINERS / EXPANDERS
+       ========================================================= */
+    [data-testid="stVerticalBlockBorderWrapper"] {
+        border: 1px solid var(--sd-line) !important;
+        border-radius: var(--sd-radius) !important;
+        background: rgba(255,255,255,.94) !important;
+        box-shadow: var(--sd-shadow-sm) !important;
+        transition: transform .22s ease, box-shadow .22s ease, border-color .22s ease;
+    }
+
+    [data-testid="stVerticalBlockBorderWrapper"]:hover {
+        transform: translateY(-2px);
+        border-color: rgba(91,99,246,.14) !important;
+        box-shadow: var(--sd-shadow-md) !important;
+    }
+
+    [data-testid="stExpander"] {
+        border: 1px solid var(--sd-line) !important;
+        border-radius: 16px !important;
+        background: rgba(255,255,255,.94) !important;
+        box-shadow: var(--sd-shadow-sm) !important;
+        overflow: hidden;
+        margin: 10px 0;
+        transition: border-color .2s ease, box-shadow .2s ease;
+    }
+
+    [data-testid="stExpander"]:hover {
+        border-color: rgba(91,99,246,.16) !important;
+        box-shadow: var(--sd-shadow-md) !important;
+    }
+
+    [data-testid="stExpander"] summary {
+        color: var(--sd-ink) !important;
+        font-family: 'Noto Sans KR', sans-serif !important;
         font-weight: 800;
-        color: var(--mint-primary);
     }
+
+    .sd-stage-heading {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        width: fit-content;
+        max-width: 100%;
+        margin: 20px 0 6px;
+        padding: 10px 16px 10px 10px;
+        border: 1px solid #E2E5F0;
+        border-radius: 16px;
+        background: rgba(255,255,255,.98);
+        color: #171A2B !important;
+        box-shadow: 0 7px 20px rgba(25,31,57,.06);
+        font-family: 'Jua', 'Noto Sans KR', sans-serif;
+        font-size: clamp(1.12rem, 1.9vw, 1.48rem);
+        font-weight: 800;
+        line-height: 1.2;
+    }
+
+    .sd-stage-heading .step {
+        display: inline-flex;
+        align-items: center;
+        min-height: 32px;
+        padding: 0 11px;
+        border-radius: 10px;
+        background: linear-gradient(135deg, var(--sd-primary), var(--sd-primary-2));
+        color: #FFFFFF !important;
+        font-family: 'Noto Sans KR', sans-serif;
+        font-size: .78rem;
+        font-weight: 800;
+        white-space: nowrap;
+        box-shadow: 0 6px 14px rgba(91,99,246,.22);
+    }
+
+    .sd-stage-heading > span:last-child {
+        color: #171A2B !important;
+        text-shadow: none;
+    }
+
+    /* =========================================================
+       SCORE / BENTO SUMMARY
+       ========================================================= */
+    .score-wrap {
+        display: grid;
+        grid-template-columns: 230px minmax(0, 1fr);
+        gap: 30px;
+        align-items: center;
+        margin: 12px 0 16px;
+        padding: 28px;
+        border: 1px solid rgba(91,99,246,.12);
+        border-radius: 28px;
+        background:
+            linear-gradient(135deg, rgba(255,255,255,.97), rgba(248,249,255,.95));
+        box-shadow: var(--sd-shadow-md);
+        animation: sd-fade-up .5s .12s cubic-bezier(.2,.8,.2,1) both;
+    }
+
+    .score-ring {
+        --score: 0;
+        width: 204px;
+        height: 204px;
+        border-radius: 50%;
+        background:
+            radial-gradient(circle at center, #FFFFFF 0 59%, transparent 60%),
+            conic-gradient(
+                var(--sd-primary) calc(var(--score) * 1%),
+                #E8EAF5 0
+            );
+        border: 1px solid rgba(91,99,246,.14);
+        box-shadow: var(--sd-shadow-md);
+        display: grid;
+        place-items: center;
+        position: relative;
+        margin: auto;
+        transform: rotate(-8deg);
+        transition: transform .3s cubic-bezier(.2,.8,.2,1), box-shadow .25s ease;
+        animation: sd-score-in .8s .12s cubic-bezier(.2,.8,.2,1) both;
+    }
+
+    .score-ring:hover {
+        transform: rotate(-2deg) scale(1.035);
+        box-shadow: var(--sd-shadow-lg);
+    }
+
+    .score-ring::after {
+        content: "";
+        position: absolute;
+        inset: 20px;
+        border-radius: 50%;
+        background: rgba(255,255,255,.96);
+        border: 1px solid rgba(91,99,246,.08);
+        box-shadow: inset 0 0 22px rgba(91,99,246,.045);
+    }
+
+    .score-center {
+        position: relative;
+        z-index: 2;
+        text-align: center;
+        transform: rotate(8deg);
+    }
+
+    .score-center .num {
+        font-family: 'Jua', 'Noto Sans KR', sans-serif;
+        font-size: 2.7rem;
+        line-height: 1;
+        color: var(--sd-primary);
+    }
+
+    .score-center .unit {
+        margin-top: 5px;
+        color: var(--sd-muted);
+        font-size: .76rem;
+        font-weight: 800;
+    }
+
+    .score-info h3 { margin: 0 0 7px !important; }
+    .score-info p { margin: 0 0 16px !important; color: var(--sd-muted); }
+
+    .score-badges {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    .score-badge {
+        display: inline-flex;
+        align-items: center;
+        min-height: 32px;
+        border: 1px solid var(--sd-line-strong);
+        border-radius: 999px;
+        padding: 5px 10px;
+        background: #FFFFFF;
+        color: var(--sd-ink);
+        font-size: .75rem;
+        font-weight: 800;
+        box-shadow: 0 2px 8px rgba(25,31,57,.03);
+    }
+
+    .score-badge.good { background: rgba(99,215,177,.18); border-color: rgba(61,185,138,.23); }
+    .score-badge.warn { background: rgba(255,217,125,.27); border-color: rgba(233,182,77,.26); }
+    .score-badge.bad { background: rgba(255,137,180,.18); border-color: rgba(239,108,132,.23); }
+
+    .sd-mini-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0,1fr));
+        gap: 12px;
+        margin: 0 0 24px;
+    }
+
+    .sd-mini {
+        position: relative;
+        overflow: hidden;
+        min-height: 94px;
+        padding: 15px 16px;
+        border: 1px solid var(--sd-line);
+        border-radius: 17px;
+        background: #FFFFFF;
+        box-shadow: var(--sd-shadow-sm);
+        transition: transform .2s ease, box-shadow .2s ease;
+    }
+
+    .sd-mini::after {
+        content: "";
+        position: absolute;
+        width: 56px;
+        height: 56px;
+        right: -18px;
+        bottom: -18px;
+        border-radius: 50%;
+        background: rgba(91,99,246,.065);
+    }
+
+    .sd-mini:hover {
+        transform: translateY(-3px);
+        box-shadow: var(--sd-shadow-md);
+    }
+
+    .sd-mini b {
+        display: block;
+        margin-bottom: 3px;
+        font-family: 'Jua', 'Noto Sans KR', sans-serif;
+        font-size: 1.3rem;
+        color: var(--sd-ink);
+    }
+
+    .sd-mini span {
+        color: var(--sd-muted);
+        font-size: .74rem;
+        font-weight: 700;
+    }
+
+    /* =========================================================
+       METRICS / FILE UPLOAD / PROGRESS / IMAGE
+       ========================================================= */
+    [data-testid="stMetric"] {
+        background: rgba(255,255,255,.94);
+        border: 1px solid var(--sd-line);
+        border-radius: 17px;
+        box-shadow: var(--sd-shadow-sm);
+        padding: 15px 16px;
+        transition: transform .2s ease, box-shadow .2s ease;
+    }
+
+    [data-testid="stMetric"]:hover {
+        transform: translateY(-2px);
+        box-shadow: var(--sd-shadow-md);
+    }
+
+    [data-testid="stMetricLabel"] {
+        color: var(--sd-muted) !important;
+        font-weight: 700;
+    }
+
+    [data-testid="stFileUploaderDropzone"] {
+        min-height: 170px;
+        display: grid;
+        place-items: center;
+        border: 1px dashed #CCD1E2 !important;
+        border-radius: 20px !important;
+        background:
+            linear-gradient(180deg, #FFFFFF, #FBFBFF) !important;
+        box-shadow: var(--sd-shadow-sm);
+        transition: transform .2s ease, border-color .2s ease, background-color .2s ease, box-shadow .2s ease;
+    }
+
+    [data-testid="stFileUploaderDropzone"]:hover {
+        transform: translateY(-2px);
+        border-color: rgba(91,99,246,.4) !important;
+        background: #FCFCFF !important;
+        box-shadow: var(--sd-shadow-md);
+    }
+
+    [data-testid="stProgressBar"] > div > div > div {
+        background: linear-gradient(90deg, var(--sd-primary), var(--sd-primary-2)) !important;
+        border-radius: 999px !important;
+    }
+
+    [data-testid="stProgressBar"] > div {
+        border: 1px solid var(--sd-line) !important;
+        border-radius: 999px;
+        background: #FFFFFF;
+    }
+
+    [data-testid="stImage"] img {
+        border: 1px solid var(--sd-line) !important;
+        border-radius: 18px;
+        background: #FFFFFF;
+        box-shadow: var(--sd-shadow-sm);
+        transition: transform .2s ease, box-shadow .2s ease;
+    }
+
+    [data-testid="stImage"] img:hover {
+        transform: translateY(-2px);
+        box-shadow: var(--sd-shadow-md);
+    }
+
+    /* =========================================================
+       ALERTS / CHECKS / DIVIDERS
+       ========================================================= */
+    [data-testid="stAlert"] {
+        border-radius: 15px !important;
+        border-width: 1px !important;
+        box-shadow: var(--sd-shadow-sm);
+    }
+
+    [data-testid="stCheckbox"] label,
+    [data-testid="stRadio"] label {
+        color: var(--sd-ink) !important;
+    }
+
+    hr {
+        border: 0 !important;
+        border-top: 1px solid var(--sd-line) !important;
+        margin: 30px 0 !important;
+    }
+
+    [data-testid="stSlider"] [role="slider"] {
+        background: var(--sd-primary) !important;
+        border: 2px solid #FFFFFF !important;
+        box-shadow: 0 0 0 1px rgba(91,99,246,.18), 0 4px 12px rgba(91,99,246,.18);
+    }
+
+    /* =========================================================
+       TODO / RESULT ROWS
+       ========================================================= */
     .todo-row {
-        border-left: 4px solid var(--mint-primary);
-        background: white;
-        border-radius: 8px;
-        padding: 8px 12px;
-        margin-bottom: 8px;
+        padding: 15px 17px;
+        margin: 9px 0;
+        border: 1px solid var(--sd-line);
+        border-radius: 15px;
+        background: #FFFFFF;
+        box-shadow: var(--sd-shadow-sm);
+        transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease;
+        animation: sd-fade-up .45s cubic-bezier(.2,.8,.2,1) both;
     }
-    .todo-row.fail { border-left-color: #B3261E; }
-    .todo-row.warn { border-left-color: #8A6300; }
+
+    .todo-row:hover {
+        transform: translateX(3px);
+        box-shadow: var(--sd-shadow-md);
+    }
+
+    .todo-row.fail { border-left: 4px solid var(--sd-danger); }
+    .todo-row.warn { border-left: 4px solid var(--sd-warning); }
+
+    /* =========================================================
+       ANIMATION
+       ========================================================= */
+    @keyframes sd-hero-in {
+        from { opacity: 0; transform: translateY(10px) scale(.992); }
+        to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    @keyframes sd-fade-up {
+        from { opacity: 0; transform: translateY(12px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+
+    @keyframes sd-float {
+        0%, 100% { transform: translateY(-50%) translate3d(0,0,0); }
+        50% { transform: translateY(calc(-50% - 9px)) translate3d(0,0,0); }
+    }
+
+    @keyframes sd-score-in {
+        from { opacity: 0; transform: rotate(-18deg) scale(.9); }
+        to { opacity: 1; transform: rotate(-8deg) scale(1); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after {
+            animation-duration: .01ms !important;
+            animation-iteration-count: 1 !important;
+            transition-duration: .01ms !important;
+            scroll-behavior: auto !important;
+        }
+    }
+
+    /* =========================================================
+       RESPONSIVE
+       ========================================================= */
+    @media (max-width: 960px) {
+        .hero-banner { min-height: 290px; padding: 38px 28px; }
+        .hero-banner::before { right: -30px; opacity: .75; }
+        .hero-banner::after { right: 8%; }
+        .score-wrap { grid-template-columns: 1fr; text-align: center; }
+        .score-badges { justify-content: center; }
+        .sd-mini-grid { grid-template-columns: 1fr 1fr; }
+        .sd-flow { grid-template-columns: 1fr 1fr; }
+    }
+
+    @media (max-width: 600px) {
+        .block-container { padding-left: .8rem !important; padding-right: .8rem !important; }
+        .hero-banner { min-height: 250px; padding: 28px 20px; border-radius: 22px; }
+        .hero-banner h1 { font-size: 2.35rem !important; }
+        .hero-banner p { font-size: .92rem; }
+        .hero-banner::before { width: 160px; height: 160px; right: -38px; }
+        .hero-banner::after { width: 54px; height: 54px; right: 9%; }
+        .sd-flow { grid-template-columns: 1fr; }
+        .sd-mini-grid { grid-template-columns: 1fr; }
+        .score-ring { width: 180px; height: 180px; }
+        .score-wrap { padding: 21px 17px; border-radius: 22px; }
+        [data-testid="stTabs"] [data-baseweb="tab"] { padding: 0 11px; font-size: .8rem; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 
-def _render_auth_gate() -> str | None:
-    """프로토타입 로그인/회원가입 화면."""
+def _restore_auth_from_cookie() -> str | None:
+    """브라우저 세션 쿠키가 있으면 현재 Streamlit 세션으로 로그인 상태를 복원합니다."""
     if st.session_state.get("auth_user"):
+        return str(st.session_state["auth_user"])
+
+    session_token = None
+    try:
+        session_token = st.context.cookies.get("sd_session_token")
+    except Exception:
+        session_token = None
+
+    if not session_token:
+        try:
+            session_token = _cookie_controller.get("sd_session_token")
+        except Exception:
+            session_token = None
+
+    if session_token:
+        username = get_username_by_session(str(session_token))
+        if username:
+            st.session_state["auth_user"] = username
+            st.session_state["auth_session_token"] = str(session_token)
+            return username
+    return None
+
+
+def _set_auth_cookie(username: str) -> bool:
+    token = create_login_session(username)
+    if not token:
+        return False
+    try:
+        secure = str(getattr(st.context, "url", "")).startswith("https://")
+    except Exception:
+        secure = False
+    try:
+        # 만료일을 지정하지 않아 브라우저를 닫으면 세션이 종료됩니다.
+        _cookie_controller.set(
+            "sd_session_token",
+            token,
+            path="/",
+            secure=secure,
+            same_site="lax",
+        )
+    except Exception:
+        delete_login_session(token)
+        return False
+    st.session_state["auth_user"] = username.strip()
+    st.session_state["auth_session_token"] = token
+    return True
+
+
+def _logout() -> None:
+    token = st.session_state.get("auth_session_token")
+    try:
+        if token:
+            delete_login_session(str(token))
+        _cookie_controller.remove("sd_session_token")
+    except Exception:
+        pass
+    st.session_state.pop("auth_user", None)
+    st.session_state.pop("auth_session_token", None)
+    time.sleep(0.5)
+    st.rerun()
+
+
+def _render_auth_gate() -> str | None:
+    """아이디/비밀번호 로그인. 새로고침 시 브라우저 세션 쿠키로 복원합니다."""
+    restored_user = _restore_auth_from_cookie()
+    if restored_user:
+        if "sd_active_tab" not in st.session_state:
+            st.session_state["sd_active_tab"] = "check"
+
         with st.sidebar:
             st.markdown("### 👤 로그인 상태")
-            st.success(f"{st.session_state['auth_user']}님")
-            if st.button("로그아웃"):
-                st.session_state.pop("auth_user", None)
+            st.success(f"{restored_user}님")
+            st.caption("현재 로그인한 계정")
+            st.markdown("### 🧭 메뉴")
+
+            if st.button("🩺 검사하기", key="sidebar_nav_check", use_container_width=True):
+                st.session_state["sd_active_tab"] = "check"
                 st.rerun()
-        return st.session_state["auth_user"]
+            if st.button("📚 히스토리", key="sidebar_nav_history", use_container_width=True):
+                st.session_state["sd_active_tab"] = "history"
+                st.rerun()
+            if st.button("💬 리뷰", key="sidebar_nav_reviews", use_container_width=True):
+                st.session_state["sd_active_tab"] = "reviews"
+                st.rerun()
+
+            st.divider()
+            if st.button("로그아웃", key="auth_logout", use_container_width=True):
+                _logout()
+        return restored_user
 
     st.markdown(
         """
@@ -138,9 +1192,13 @@ def _render_auth_gate() -> str | None:
             password = st.text_input("비밀번호", type="password", key="login_password")
             submitted = st.form_submit_button("로그인", type="primary")
         if submitted:
-            if verify_user(username, password):
-                st.session_state["auth_user"] = username.strip()
-                st.rerun()
+            clean_username = username.strip()
+            if verify_user(clean_username, password):
+                if _set_auth_cookie(clean_username):
+                    time.sleep(0.7)
+                    st.rerun()
+                else:
+                    st.error("로그인 세션을 저장하지 못했습니다. 다시 시도해주세요.")
             else:
                 st.error("아이디 또는 비밀번호가 올바르지 않습니다.")
 
@@ -160,25 +1218,51 @@ def _render_auth_gate() -> str | None:
                 else:
                     st.error(message)
 
-    st.caption("현재 버전은 계정/기록 기능의 MVP입니다. 실제 서비스 배포 전에는 외부 인증/영구 DB로 이전하는 것을 권장합니다.")
+    st.caption("로그인 상태는 브라우저 세션 동안 유지되며, 직접 로그아웃하면 즉시 종료됩니다.")
     return None
 
 
 current_user = _render_auth_gate()
+if _completion_sound_component is not None:
+    _completion_sound_component(
+        data={
+            "play": False,
+            "nonce": 0,
+            "authenticated": bool(current_user),
+            "target_tab": str(st.session_state.get("sd_active_tab", "check")),
+        }
+    )
 if not current_user:
     st.stop()
 
 st.markdown(
     """
     <div class="hero-banner">
-        <h1>🩺 OGQ 스티커 닥터</h1>
-        <p>내 스티커의 문제를 찾고, OGQ 시장의 기존 콘텐츠와 비교해 수정 방향을 잡아보세요.</p>
+        <div class="sd-kicker">🩺 OGQ STICKER DOCTOR</div>
+        <h1>내 스티커,<br>어디가 문제일까요?</h1>
+        <p>규격부터 시장 비교, AI 문제 위치 표시, 나만의 검사 기준까지 한곳에서 확인해보세요.</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-st.caption(f"현재 로그인: {current_user}")
+col_head_a, col_head_b = st.columns([8, 2])
+with col_head_a:
+    st.caption(f"현재 로그인 · {current_user}")
+with col_head_b:
+    st.markdown('<div class="sd-note" style="text-align:center;font-weight:800;">CREATE · CHECK · IMPROVE</div>', unsafe_allow_html=True)
+
+st.markdown(
+    """
+    <div class="sd-flow">
+      <span class="sd-flow-item">📐 규격 검사</span><span class="sd-flow-arrow">→</span>
+      <span class="sd-flow-item">📊 시장 비교</span><span class="sd-flow-arrow">→</span>
+      <span class="sd-flow-item">🧠 AI 진단</span><span class="sd-flow-arrow">→</span>
+      <span class="sd-flow-item">🛠 개선</span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 def _draw_annotations(file_bytes: bytes, findings: list[dict]) -> Image.Image:
     """Gemini 공식 bbox 형식 [ymin, xmin, ymax, xmax]을 실제 이미지 좌표로 변환한다."""
@@ -237,11 +1321,17 @@ def _draw_annotations(file_bytes: bytes, findings: list[dict]) -> Image.Image:
 
 
 def _speak_completion(message: str = "") -> None:
-    """진단 완료 시 브라우저에서 짧은 2음 벨소리(띠링)를 재생한다.
+    """진단/시장 비교 완료 시 짧은 2음 벨소리를 재생합니다."""
+    if _completion_sound_component is not None:
+        _completion_sound_component(
+            data={
+                "play": True,
+                "nonce": int(time.time() * 1000000),
+            }
+        )
+        return
 
-    기존 음성 합성(TTS)은 사용하지 않는다. 브라우저의 자동재생 정책에 의해
-    소리가 차단될 경우를 대비해 수동 재생 버튼을 함께 제공한다.
-    """
+    # 구버전 Streamlit에서는 기존 iframe 방식으로 폴백합니다.
     components.html(
         """
         <div style="font-family:sans-serif; padding:2px 0;">
@@ -249,49 +1339,33 @@ def _speak_completion(message: str = "") -> None:
         </div>
         <script>
         (() => {
-          let played = false;
-
           function ding() {
             try {
-              const AudioContext = window.AudioContext || window.webkitAudioContext;
-              if (!AudioContext) return;
-
-              const ctx = new AudioContext();
+              const AC = window.AudioContext || window.webkitAudioContext;
+              if (!AC) return;
+              const ctx = new AC();
               const now = ctx.currentTime;
-
               const gain = ctx.createGain();
               gain.gain.setValueAtTime(0.0001, now);
               gain.gain.exponentialRampToValueAtTime(0.42, now + 0.015);
               gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.42);
               gain.connect(ctx.destination);
-
               const osc1 = ctx.createOscillator();
               osc1.type = 'sine';
               osc1.frequency.setValueAtTime(880, now);
               osc1.frequency.exponentialRampToValueAtTime(1320, now + 0.10);
               osc1.connect(gain);
-
               const osc2 = ctx.createOscillator();
               osc2.type = 'sine';
               osc2.frequency.setValueAtTime(1320, now + 0.12);
               osc2.frequency.exponentialRampToValueAtTime(1760, now + 0.22);
               osc2.connect(gain);
-
-              osc1.start(now);
-              osc1.stop(now + 0.11);
-              osc2.start(now + 0.12);
-              osc2.stop(now + 0.28);
-
+              osc1.start(now); osc1.stop(now + 0.11);
+              osc2.start(now + 0.12); osc2.stop(now + 0.28);
               setTimeout(() => { try { ctx.close(); } catch (_) {} }, 650);
-              played = true;
-            } catch (_) {
-              // 브라우저 자동재생/AudioContext 제한 시 수동 버튼으로 재생 가능
-            }
+            } catch (_) {}
           }
-
-          const btn = document.getElementById('ding-btn');
-          btn?.addEventListener('click', ding);
-          setTimeout(() => { if (!played) ding(); }, 100);
+          document.getElementById('ding-btn')?.addEventListener('click', ding);
         })();
         </script>
         """,
@@ -395,7 +1469,7 @@ def _render_review_for_history(current_user: str, record: dict, developer_mode: 
     existing = load_reviews_for_record(record["id"], include_developer_only=True)
     own = next((r for r in existing if r.get("username") == current_user), None)
 
-    with st.form(f"review_form_{record['id']}"):
+    with st.form(f"review_form_history_{record['id']}"):
         overall = st.slider("전체 만족도", 1, 5, int(own["overall_rating"]) if own else 4)
         usefulness = st.slider("도움이 된 정도", 1, 5, int(own["usefulness_rating"]) if own else 4)
         accuracy = st.slider("진단 정확도", 1, 5, int(own["accuracy_rating"]) if own else 4)
@@ -459,6 +1533,128 @@ def _render_review_for_history(current_user: str, record: dict, developer_mode: 
                 st.caption(" · ".join(review["issue_tags"]))
             if review.get("comment"):
                 st.write(review["comment"])
+
+
+def _save_current_diagnosis_to_history(
+    current_user: str,
+    all_file_results: list[dict],
+    selected_criteria: list[str],
+    custom_rules: list[str],
+    feelings: str,
+    user_tags: list[str],
+) -> int | None:
+    """현재 진단 결과를 한 번만 저장하고 record id를 세션에 기억합니다."""
+    run_key_material = "|".join(
+        f"{fr.get('name','')}:{hashlib.sha256(fr.get('bytes', b'')).hexdigest()}"
+        for fr in all_file_results
+    )
+    run_key = hashlib.sha256(run_key_material.encode("utf-8")).hexdigest()
+
+    if (
+        st.session_state.get("current_history_run_key") == run_key
+        and st.session_state.get("current_history_record_id")
+    ):
+        return int(st.session_state["current_history_record_id"])
+
+    grades = [
+        grade
+        for fr in all_file_results
+        for grade, _, _ in fr.get("results", [])
+    ]
+    checklist_status = {
+        label: bool(st.session_state.get(f"chk_{key}", False))
+        for label, key in {
+            "저작권 있는 폰트를 상업적으로 이용 가능한 라이선스로만 사용했다": "font_license",
+            "생성형 AI 사용 여부와 관련 규정을 확인했다": "ai_rule_check",
+            "다른 판매자의 기존 콘텐츠와 차별화되는 요소가 있다": "no_duplicate",
+            "텍스트가 잘리지 않고 세이프존 안에 들어와 있다": "text_safezone",
+            "욕설·폭력·선정성·정치/종교 관련 부적합 요소가 없다": "no_sensitive_content",
+        }.items()
+    }
+    checklist_done = sum(checklist_status.values())
+    checklist_total = len(checklist_status)
+    record_id = save_diagnosis_record(
+        current_user,
+        score=compute_score(all_file_results, checklist_done, checklist_total),
+        pass_count=grades.count("pass"),
+        warn_count=grades.count("warn"),
+        fail_count=grades.count("fail"),
+        checklist_done=checklist_done,
+        checklist_total=checklist_total,
+        file_count=len(all_file_results),
+        market_keywords=_keywords_from_user_input(feelings, user_tags, limit=5),
+        diagnosis_payload=_build_history_payload(
+            all_file_results,
+            selected_criteria,
+            custom_rules,
+            feelings,
+            user_tags,
+        ),
+    )
+    if record_id:
+        st.session_state["current_history_run_key"] = run_key
+        st.session_state["current_history_record_id"] = int(record_id)
+    return record_id
+
+
+def _render_immediate_review(current_user: str, record_id: int) -> None:
+    """검사 완료 직후 같은 화면에서 리뷰를 남길 수 있게 합니다."""
+    history = load_user_diagnosis_history(current_user, limit=50)
+    record = next((item for item in history if int(item.get("id", -1)) == int(record_id)), None)
+    if not record:
+        st.error("방금 완료한 진단 기록을 불러오지 못했습니다. 히스토리 탭에서 확인해주세요.")
+        return
+    with st.expander("💬 방금 받은 AI 진단 리뷰 남기기", expanded=True):
+        existing = load_reviews_for_record(record_id, include_developer_only=True)
+        own = next((r for r in existing if r.get("username") == current_user), None)
+        with st.form(f"review_form_immediate_{record_id}"):
+            overall = st.slider("전체 만족도", 1, 5, int(own["overall_rating"]) if own else 4, key=f"immediate_overall_{record_id}")
+            usefulness = st.slider("도움이 된 정도", 1, 5, int(own["usefulness_rating"]) if own else 4, key=f"immediate_usefulness_{record_id}")
+            accuracy = st.slider("진단 정확도", 1, 5, int(own["accuracy_rating"]) if own else 4, key=f"immediate_accuracy_{record_id}")
+            issue_tags = st.multiselect(
+                "아쉬웠던 부분 (여러 개 선택 가능)",
+                [
+                    "문제 위치가 부정확함",
+                    "시장 비교가 부정확함",
+                    "비슷한 콘텐츠 판단이 아쉬움",
+                    "설명이 너무 일반적임",
+                    "수정 방법이 구체적이지 않음",
+                    "오탈자/텍스트 인식이 부정확함",
+                    "결과가 너무 길거나 복잡함",
+                    "특별한 아쉬움 없음",
+                ],
+                default=(own.get("issue_tags", []) if own else []),
+                key=f"immediate_issue_tags_{record_id}",
+            )
+            comment = st.text_area(
+                "추가 의견",
+                value=(own.get("comment", "") if own else ""),
+                placeholder="예: 시장 비교는 좋았지만 문제 위치를 조금 더 정확하게 표시해주면 좋겠습니다.",
+                key=f"immediate_comment_{record_id}",
+            )
+            visibility_label = st.radio(
+                "리뷰 공개 범위",
+                ["모두 공개", "개발자만 보기"],
+                index=0 if not own or own.get("visibility") == "public" else 1,
+                horizontal=True,
+                key=f"immediate_visibility_{record_id}",
+            )
+            submitted = st.form_submit_button("리뷰 저장", type="primary")
+        if submitted:
+            saved = save_review(
+                current_user, record_id,
+                overall_rating=overall,
+                usefulness_rating=usefulness,
+                accuracy_rating=accuracy,
+                issue_tags=issue_tags,
+                comment=comment,
+                visibility="public" if visibility_label == "모두 공개" else "developer",
+            )
+            if saved:
+                st.success("리뷰가 저장됐어요. 다음 AI 개선에 활용할 수 있습니다.")
+                st.rerun()
+            else:
+                st.error("리뷰 저장에 실패했습니다.")
 
 
 def _render_history_detail(current_user: str, record: dict, developer_mode: bool = False) -> None:
@@ -785,15 +1981,18 @@ def _run_ai_diagnostics(
     return had_success
 
 
-tab_check, tab_history, tab_reviews = st.tabs(["🩺 검사하기", "📚 히스토리", "💬 리뷰"])
+st.markdown('<div class="sd-kicker">WORKSPACE</div>', unsafe_allow_html=True)
 
-with tab_history:
+# 사이드바에서 선택한 메뉴를 기준으로 실제 화면을 전환합니다.
+# st.tabs의 브라우저 탭을 JS로 강제 클릭하는 방식 대신 Streamlit이 직접 렌더링하므로
+# 메뉴 클릭 후에도 히스토리/리뷰 화면이 확실하게 표시됩니다.
+active_tab = st.session_state.get("sd_active_tab", "check")
+
+if active_tab == "history":
     _render_history_center(current_user)
-
-with tab_reviews:
+elif active_tab == "reviews":
     _render_review_center(current_user)
-
-with tab_check:
+else:
     # ---------- 0단계: 검사 기준 ----------
     st.header("검사 기준 설정")
     st.caption("OGQ 공개 가이드를 기본으로 불러오고, 원하는 검사 항목만 선택하거나 나만의 기준을 원하는 만큼 추가할 수 있어요.")
@@ -873,7 +2072,7 @@ with tab_check:
     user_tags = [t.strip().lstrip("#") for t in tag_text.split(",") if t.strip()]
 
     st.header("2단계 · 스티커 업로드")
-    st.caption("OGQ 공개 제작 가이드 기준: 메인 240x240 · 스티커 740x640 · 탭 96x74, 각 1MB 이하, RGB, 투명 배경")
+    st.caption("OGQ 공개 제작 가이드 기준: 메인 240x240 · 스티커 740x640 · 탭 96x74, 각 1MB 이하, RGB, 투명 배경 · 파일마다 이미지 종류를 직접 지정할 수 있어요.")
 
     files = st.file_uploader(
         "스티커 이미지를 올려주세요 (여러 장 가능)",
@@ -882,12 +2081,57 @@ with tab_check:
     )
 
     if files:
+        current_upload_material = "|".join(
+            f"{f.name}:{hashlib.sha256(f.getvalue()).hexdigest()}" for f in files
+        )
+        current_upload_key = hashlib.sha256(current_upload_material.encode("utf-8")).hexdigest()
+        if st.session_state.get("current_upload_key") != current_upload_key:
+            st.session_state["current_upload_key"] = current_upload_key
+            st.session_state.pop("current_history_run_key", None)
+            st.session_state.pop("current_history_record_id", None)
+
         type_counts = {name: 0 for name in SPECS}
         all_file_results = []
 
-        for f in files:
+        st.info("각 파일이 메인 이미지인지, 스티커 이미지인지, 탭 이미지인지 직접 지정해주세요.\n파일 크기가 규격과 맞는 경우에는 자동으로 해당 종류를 먼저 선택해 드립니다.")
+
+        def _guess_image_type(filename, width=None, height=None):
+            # 1순위: 실제 해상도가 OGQ 규격과 정확히 일치하면 그 종류를 자동 선택
+            if width is not None and height is not None:
+                detected = classify_type(width, height)
+                if detected:
+                    return detected
+
+            # 2순위: 파일명에 흔한 종류 표기가 있으면 보조적으로 추정
+            lowered = filename.lower()
+            if any(token in lowered for token in ("tab", "탭")):
+                return "탭 이미지"
+            if any(token in lowered for token in ("main", "메인", "대표", "thumbnail", "thumb")):
+                return "메인 이미지"
+            return "스티커 이미지"
+
+        for index, f in enumerate(files):
             file_bytes = f.getvalue()
-            img_type, results = check_image(file_bytes, f.name)
+            try:
+                preview_img = Image.open(io.BytesIO(file_bytes))
+                width, height = preview_img.size
+            except Exception:
+                width, height = None, None
+
+            detected_type = classify_type(width, height) if width is not None and height is not None else None
+            default_type = _guess_image_type(f.name, width, height)
+            default_index = list(SPECS.keys()).index(default_type)
+            file_hash = hashlib.sha256(file_bytes).hexdigest()[:16]
+
+            selected_type = st.selectbox(
+                f"{f.name} · 이미지 종류",
+                list(SPECS.keys()),
+                index=default_index,
+                key=f"image_type_{file_hash}",
+                help="이 파일을 OGQ 제출 구성에서 어떤 이미지로 사용할지 지정합니다.",
+            )
+
+            img_type, results = check_image(file_bytes, f.name, expected_type=selected_type)
             if img_type:
                 type_counts[img_type] += 1
 
@@ -897,14 +2141,19 @@ with tab_check:
                     "bytes": file_bytes,
                     "mime": f.type or "image/png",
                     "img_type": img_type,
+                    "expected_type": selected_type,
+                    "detected_type": detected_type,
                     "results": results,
                 }
             )
 
+            detected_text = detected_type or "일치하는 규격 없음"
+            st.caption(f"지정: **{selected_type}** · 실제 크기: **{width}×{height}px** · 크기만으로 추정: **{detected_text}**")
+
             fail_count = sum(1 for grade, _, _ in results if grade == "fail")
             icon = "❌" if fail_count else "✅"
             with st.expander(
-                f"{icon} {f.name} — 문제 {fail_count}건",
+                f"{icon} {f.name} — {selected_type} · 문제 {fail_count}건",
                 expanded=fail_count > 0,
             ):
                 col1, col2 = st.columns([1, 2])
@@ -919,9 +2168,19 @@ with tab_check:
                         else:
                             st.error(f"**{item}** — {msg}")
 
+        # 시장 비교/AI 이미지 비교에는 제출용 스티커 이미지를 우선 사용한다.
+        comparison_file = next(
+            (item for item in all_file_results
+             if item.get("expected_type") == "스티커 이미지" and item.get("img_type") == "스티커 이미지"),
+            all_file_results[0] if all_file_results else None,
+        )
+
         # ---------- 3단계: 시장 비교 ----------
         st.divider()
-        st.header("3단계 · OGQ 시장 비교")
+        st.markdown(
+            '<div class="sd-stage-heading"><span class="step">3단계</span><span>OGQ 시장 비교</span></div>',
+            unsafe_allow_html=True,
+        )
         st.caption("입력한 느낌과 태그를 키워드로 OGQ 마켓의 관련 스티커를 찾고, AI가 공통점·차이점·장단점을 분석합니다.")
 
         auto_diagnose_after_market = st.checkbox(
@@ -977,7 +2236,7 @@ with tab_check:
                         # 업로드 이미지와 OGQ 검색 결과의 강한 시각 일치 신호를 먼저 계산
                         from market_analysis import annotate_visual_match_hints
                         market_results = annotate_visual_match_hints(
-                            all_file_results[0]["bytes"], market_results
+                            comparison_file["bytes"], market_results
                         )
                         # 강한 일치 신호가 있는 항목을 앞쪽으로 우선 배치
                         market_results.sort(
@@ -999,8 +2258,8 @@ with tab_check:
                                     analysis, error_message = _generate_market_ai(
                                         gemini_key,
                                         market_prompt,
-                                        all_file_results[0]["bytes"],
-                                        all_file_results[0]["mime"],
+                                        comparison_file["bytes"],
+                                        comparison_file["mime"],
                                         market_results[:8],
                                         max_output_tokens=1700,
                                     )
@@ -1042,6 +2301,9 @@ with tab_check:
 
                     except OGQAPIError as exc:
                         st.error(f"OGQ 시장 검색에 실패했어요: {exc}")
+                    else:
+                        # 3단계 시장 비교가 정상적으로 끝난 시점에 완료음을 재생합니다.
+                        _speak_completion("OGQ 시장 비교가 완료되었습니다.")
 
         # 시장 비교 완료 직후 자동 진단 옵션이 켜져 있으면 바로 AI 문제 표시까지 진행
         if auto_diagnose_after_market and st.session_state.get("market_results") and st.session_state.get("market_context"):
@@ -1180,7 +2442,10 @@ with tab_check:
 
         # ---------- 4단계: AI 진단 + 위치 표시 ----------
         st.divider()
-        st.header("4단계 · AI가 어디가 문제인지 표시")
+        st.markdown(
+            '<div class="sd-stage-heading"><span class="step">4단계</span><span>AI가 어디가 문제인지 표시</span></div>',
+            unsafe_allow_html=True,
+        )
         st.caption("선택한 검사 영역과 시장 비교 자료를 바탕으로 문제 영역을 표시하고, 무엇을/왜/어떻게 고칠지 설명합니다.")
 
         market_context = st.session_state.get("market_context", "")
@@ -1269,6 +2534,29 @@ with tab_check:
                 else:
                     st.info("이미지에서 위치를 특정할 수 있는 개선 항목이 없습니다.")
 
+        # ---------- 검사 완료 직후 리뷰 ----------
+        if diagnosis_texts:
+            st.divider()
+            st.header("💬 검사 결과 리뷰")
+            st.caption("지금 받은 진단이 실제로 도움이 되었는지 바로 남겨주세요. 리뷰를 저장하면 다음 AI 피드백 개선에 활용할 수 있습니다.")
+            current_record_id = st.session_state.get("current_history_record_id")
+            if current_record_id:
+                _render_immediate_review(current_user, int(current_record_id))
+            elif st.button("📝 이 검사 결과에 리뷰 남기기", type="secondary"):
+                record_id = _save_current_diagnosis_to_history(
+                    current_user,
+                    all_file_results,
+                    selected_criteria,
+                    custom_rules,
+                    feelings,
+                    user_tags,
+                )
+                if record_id:
+                    st.session_state["current_history_record_id"] = int(record_id)
+                    st.rerun()
+                else:
+                    st.error("리뷰를 저장할 진단 기록을 만들지 못했습니다.")
+
         # ---------- 5단계: 기존 셀프 체크리스트 ----------
         st.divider()
         st.header("5단계 · 규정 위반 셀프 체크리스트")
@@ -1297,11 +2585,48 @@ with tab_check:
             checklist_done,
             checklist_total,
         )
+        grades = [
+            grade
+            for file_result in all_file_results
+            for grade, _, _ in file_result.get("results", [])
+        ]
+        pass_count = grades.count("pass")
+        warn_count = grades.count("warn")
+        fail_count = grades.count("fail")
+        market_hits = len(st.session_state.get("market_results", []) or [])
+        custom_count = len(custom_rules)
+        todo_preview_count = len(build_priority_todo(all_file_results))
+        score_message = (
+            "기본 검사 기준을 대부분 충족하고 있어요." if score >= 85 else
+            "큰 문제는 적지만 몇 가지 개선 포인트를 확인해보세요." if score >= 70 else
+            "제출 전에 우선순위가 높은 문제부터 수정하는 것을 권장해요."
+        )
         st.markdown(
             f"""
-            <div class="score-card">
-                <div>OGQ 준비도 점수</div>
-                <div class="score-num">{score:.0f}점 <span style="font-size:1rem; font-weight:400;">/ 100점</span></div>
+            <div class="score-wrap">
+              <div class="score-ring" style="--score:{score:.0f};">
+                <div class="score-center">
+                  <div class="num">{score:.0f}</div>
+                  <div class="unit">/ 100 · 준비도</div>
+                </div>
+              </div>
+              <div class="score-info">
+                <h3>✨ OGQ 준비도 점수</h3>
+                <p>{score_message}</p>
+                <div class="score-badges">
+                  <span class="score-badge good">🟢 정상 {pass_count}</span>
+                  <span class="score-badge warn">🟡 주의 {warn_count}</span>
+                  <span class="score-badge bad">🔴 실패 {fail_count}</span>
+                  <span class="score-badge">📊 시장 결과 {market_hits}</span>
+                  <span class="score-badge">🧩 커스텀 기준 {custom_count}</span>
+                </div>
+              </div>
+            </div>
+            <div class="sd-mini-grid">
+              <div class="sd-mini"><b>{len(all_file_results)}개</b><span>검사한 파일</span></div>
+              <div class="sd-mini"><b>{checklist_done}/{checklist_total}</b><span>체크리스트 완료</span></div>
+              <div class="sd-mini"><b>{todo_preview_count}개</b><span>우선 수정 항목</span></div>
+              <div class="sd-mini"><b>{market_hits}개</b><span>시장 참고 콘텐츠</span></div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1350,44 +2675,16 @@ with tab_check:
         with col_b:
             st.caption("저장하면 점수뿐 아니라 시장 비교, AI 문제 위치 표시, 적용된 검사 기준, 사용자 지정 기준 결과까지 함께 보관됩니다.")
             if st.button("💾 이번 결과를 히스토리에 저장"):
-                pass_count = sum(
-                    1
-                    for fr in all_file_results
-                    for grade, _, _ in fr["results"]
-                    if grade == "pass"
-                )
-                warn_count = sum(
-                    1
-                    for fr in all_file_results
-                    for grade, _, _ in fr["results"]
-                    if grade == "warn"
-                )
-                fail_count = sum(
-                    1
-                    for fr in all_file_results
-                    for grade, _, _ in fr["results"]
-                    if grade == "fail"
-                )
-                record_id = save_diagnosis_record(
+                record_id = _save_current_diagnosis_to_history(
                     current_user,
-                    score=score,
-                    pass_count=pass_count,
-                    warn_count=warn_count,
-                    fail_count=fail_count,
-                    checklist_done=checklist_done,
-                    checklist_total=checklist_total,
-                    file_count=len(all_file_results),
-                    market_keywords=_keywords_from_user_input(feelings, user_tags, limit=5),
-                    diagnosis_payload=_build_history_payload(
-                        all_file_results,
-                        selected_criteria,
-                        custom_rules,
-                        feelings,
-                        user_tags,
-                    ),
+                    all_file_results,
+                    selected_criteria,
+                    custom_rules,
+                    feelings,
+                    user_tags,
                 )
                 if record_id:
-                    st.success("내 계정의 진단 히스토리에 저장했어요. 상단의 '내 진단 히스토리'에서 언제든지 다시 볼 수 있습니다.")
+                    st.success("내 계정의 진단 히스토리에 저장했어요. 상단의 '히스토리' 탭에서 언제든지 다시 볼 수 있습니다.")
                     st.rerun()
                 else:
                     st.error("사용자 기록 저장에 실패했습니다.")
@@ -1403,3 +2700,13 @@ with tab_check:
             st.progress(min(have / required, 1.0))
     else:
         st.info("이미지를 올리면 OGQ 심사 기준에 맞는지 바로 검사합니다.")
+
+    # ---------- 화면 최하단 카피라이트 ----------
+    st.markdown(
+    """
+    <div style="text-align:center; margin:48px 0 16px; padding-top:18px; border-top:1px solid #e5e7eb; color:#98a2b3; font-size:0.82rem;">
+        © 2026 OGQ Sticker Doctor. All rights reserved.
+    </div>
+    """,
+    unsafe_allow_html=True,
+    )
